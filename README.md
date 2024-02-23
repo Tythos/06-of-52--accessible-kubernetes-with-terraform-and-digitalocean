@@ -147,14 +147,14 @@ output "KUBECONFIG" {
 Run another `terraform apply` and you'll be able to pipe the results to a file (which you should *DEFINITELY* add to your `.gitignore`) and identify with a `$KUBECONFIG` environmental variable:
 
 ```sh
-terraform output -raw KUBECONFIG > kubeconfig.yaml
-set KUBECONFIG="%CD%/kubeconfig.yaml"
+> terraform output -raw KUBECONFIG > kubeconfig.yaml
+> set KUBECONFIG="%CD%/kubeconfig.yaml"
 ```
 
 You can now verify that `kubectl` can communicate with your cluster:
 
 ```sh
-kubectl cluster-info
+> kubectl cluster-info
 ```
 
 Lastly, let's pass the specific config data to a second top-level provider, `hashicorp/kubernetes`. Add three new outputs to our "doproject" module: the cluster host, the cluster token, and the CA certificate:
@@ -393,6 +393,8 @@ resource "kubernetes_ingress_v1" "wwwingress" {
   }
 
   spec {
+    ingress_class_name = "nginx"
+
     rule {
       host = "${var.APP_NAME}.${var.HOST_NAME}"
 
@@ -463,4 +465,676 @@ Run a `terraform apply` and you'll see the ingress spin up. But, you can't acces
 
 ## The Ingress, It Must Be Controlled!
 
-An "ingress controller" is responsible for "enforcing" the ingress rules that you create using "Ingress" resources.
+An "ingress controller" is responsible for "enforcing" the ingress rules that you create using "Ingress" resources. Because it's not necessarily built into your cluster, there are many choices you can select from in the ingress controller universe. We'll look at using the NGINX-based ingress controller, and we'll deploy it to its own folder/module/namespace. Create an "icnamespace" folder/module and include it in your top-level `main.tf`:
+
+```tf
+module "doproject" {
+  source = "./doproject"
+}
+
+module "icnamespace" {
+  source = "./icnamespace"
+}
+
+module "wwwnamespace" {
+  source    = "./wwwnamespace"
+  APP_NAME  = "www"
+  HOST_NAME = var.HOST_NAME
+}
+```
+
+If you look at the official documentation, you'll see there are several ways to deploy the NGINX ingress controller. We'll be using a Helm-based approach for two reasons:
+
+1. It's self-contained and easy to configure & deploy
+
+1. It will be very helpful to demonstrate how easy it is to include Helm releases in your cluster's stack.
+
+1. Oh--it also has official support for integration with DigitalOcean load balanacers, so there's one less thing to worry about!
+
+Take a gander at the official Helm chart listing:
+
+https://artifacthub.io/packages/helm/ingress-nginx/ingress-nginx
+
+Let's start by adding the "Helm" provider to our top-level `providers.tf`, citing the same configuration as our "Kubernetes" provider. With all three providers, it will look something like this:
+
+```tf
+terraform {
+  required_providers {
+    digitalocean = {
+      source  = "digitalocean/digitalocean"
+      version = "2.34.1"
+    }
+
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "2.26.0"
+    }
+
+    helm = {
+      source = "hashicorp/helm"
+      version = "2.12.1"
+    }    
+  }
+}
+
+provider "digitalocean" {
+  token = var.DO_TOKEN
+}
+
+provider "kubernetes" {
+  host                   = module.doproject.CLUSTER_HOST
+  token                  = module.doproject.CLUSTER_TOKEN
+  cluster_ca_certificate = module.doproject.CLUSTER_CA
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = module.doproject.CLUSTER_HOST
+    token                  = module.doproject.CLUSTER_TOKEN
+    cluster_ca_certificate = module.doproject.CLUSTER_CA
+  }
+}
+```
+
+Now let's add a Kuberenetes namespace resource to our "icnamespace" folder/module:
+
+```tf
+resource "kubernetes_namespace" "icnamespace" {
+  metadata {
+    name = "icnamespace"
+  }
+}
+```
+
+We're now ready to deploy our ingress controller. Create a corresponding Helm release resource and cite the appropriate variable bindings via Terraform (like namespace and release values); note we "set" a particular value in the Helm release to ensure the controller's ingress class will be the default used by the cluster:
+
+```tf
+resource "helm_release" "icrelease" {
+  name       = "nginx-ingress"
+  repository = "https://kubernetes.github.io/ingress-nginx"
+  chart      = "ingress-nginx"
+  version    = "4.9.1"
+  namespace  = kubernetes_namespace.icnamespace.metadata[0].name
+
+  set {
+    name  = "controller.ingressClassResource.default"
+    value = "true"
+  }
+}
+```
+
+Now run a `terraform init` (remember we have a new provider) and a `terraform apply`. You now have a running ingress controller! Pretty slick, isn't it, to treat Helm releases as just another resource, and with values from procedural bindings? Look at the resulting resources deployed to this namespace to verify everything is running:
+
+```sh
+>kubectl get all -n icnamespace
+NAME                                                         READY   STATUS    RESTARTS   AGE
+pod/nginx-ingress-ingress-nginx-controller-55dcf9879-r2ztl   1/1     Running   0          2m50s
+
+NAME                                                       TYPE           CLUSTER-IP       EXTERNAL-IP     PORT(S)                      AGE
+service/nginx-ingress-ingress-nginx-controller             LoadBalancer   10.245.138.94    164.90.247.81   80:31874/TCP,443:30097/TCP   2m50s
+service/nginx-ingress-ingress-nginx-controller-admission   ClusterIP      10.245.120.127   <none>          443/TCP                      2m50s
+
+NAME                                                     READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/nginx-ingress-ingress-nginx-controller   1/1     1            1           2m50s
+
+NAME                                                               DESIRED   CURRENT   READY   AGE
+replicaset.apps/nginx-ingress-ingress-nginx-controller-55dcf9879   1         1         1       2m50s
+```
+
+And take another look at our ingress, which should now reflect enforcement:
+
+```sh
+> kubectl get Ingresses --all-namespaces
+```
+
+## Automating Record Management
+
+But we still can't browse to our endpoint; the domain name we registered isn't pointing to any specific address. We'll use DigitalOcean "domain" and "record" resources to apply this. And since the ingress controller's "LoadBalancer" service is the one with the external IP, we'll create them here within our "icnamespace" folder/module.
+
+Before we can do that, we need to "extract" the service resource from the Helm release. Create a `data.tf` file in the "icnamespace" folder/module and include a citation for the LoadBalancer service that was created. Note how easy it is to back out the correct resource identity, even though we didn't deploy it directly!
+
+```tf
+data "kubernetes_service" "lbicservice" {
+  metadata {
+    name      = "${helm_release.icrelease.name}-${helm_release.icrelease.chart}-controller"
+    namespace = kubernetes_namespace.icnamespace.metadata[0].name
+  }
+}
+```
+
+Now we can create a `dodomain.tf` file in the same folder/module with the following resource, citing that service's external IP:
+
+```tf
+resource "digitalocean_domain" "dodomain" {
+  name       = var.HOST_NAME
+  ip_address = data.kubernetes_service.lbicservice.status[0].load_balancer[0].ingress[0].ip
+}
+```
+
+Note we'll need to pass the `HOST_NAME` variable in from the top level, too, so create a `variables.tf` in this folder/module:
+
+```tf
+variable "HOST_NAME" {
+  type        = string
+  description = "'Base' host name to which app names will be prepended to construct FQDNs"
+}
+```
+
+And update the top-level `main.tf` accordingly:
+
+```tf
+module "doproject" {
+  source = "./doproject"
+}
+
+module "icnamespace" {
+  source    = "./icnamespace"
+  HOST_NAME = var.HOST_NAME
+}
+
+module "wwwnamespace" {
+  source    = "./wwwnamespace"
+  APP_NAME  = "www"
+  HOST_NAME = var.HOST_NAME
+}
+```
+
+We'll also need to make sure the DigitalOcean provider is required by this "icnamespace" folder/module, so create a `providers.tf` and include the following:
+
+```tf
+terraform {
+  required_providers {
+    digitalocean = {
+      source  = "digitalocean/digitalocean"
+      version = "2.34.1"
+    }
+  }
+}
+```
+
+This works for the top-level domain, but we also want to make sure subdomains will route here as well. So, we'll create a DigitalOcean record resource, `dorecord.tf`, also within the "icnamespace" folder/module, that just repeats the domain "A" record but for wildcard subdomains:
+
+```tf
+resource "digitalocean_record" "dorecord" {
+  domain = digitalocean_domain.dodomain.id
+  type   = "A"
+  name   = "*"
+  value  = digitalocean_domain.dodomain.ip_address
+}
+```
+
+Lastly, if we want, we can go back to our DigitalOcean "project" resource and make sure they are all organized under there as well, but strictly speaking this isn't necessary. You can now run `terraform init` and `terraform apply`. Then verify with a `curl` command:
+
+```sh
+> curl www.mydomain.com
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+```
+
+Pretty slick!
+
+## Batton the Hatches
+
+Our last exercise here is traditionally one of the hardest operations in systems administration. I am, of course, talking about certificate management.
+
+Fortunately, we've made a judicious selection of technologies in our stack here. It turns out to be relatively straightforward!
+
+We'll use a "cert-manager" Helm release, much like we did with our NGINX-based ingress controller, and provide the appropriate bindings to enable DigitalOcean to handle the ACME challenges directly. Since DigitalOcean is operating the nameservers our records are using, this greatly simplifies the process to the point where you may not even notice initial challenges and renewals.
+
+Create a new folder/module for "certsnamespace" and include it in the top-level `main.tf`:
+
+```tf
+module "doproject" {
+  source = "./doproject"
+}
+
+module "icnamespace" {
+  source    = "./icnamespace"
+  HOST_NAME = var.HOST_NAME
+}
+
+module "certsnamespace" {
+  source = "./certsnamespace"
+}
+
+module "wwwnamespace" {
+  source    = "./wwwnamespace"
+  APP_NAME  = "www"
+  HOST_NAME = var.HOST_NAME
+}
+```
+
+Initially, we'll just populate this with a single Kubernetes namespace before we start rolling out the Helm release. Create a `certsnamespace.tf` file and populate accordingly:
+
+```tf
+resource "kubernetes_namespace" "certsnamespace" {
+  metadata {
+    name = "certsnamespace"
+  }
+}
+```
+
+Now, create a `certmanagerrelease.tf` within this folder/module and populate accordingly. We'll want to make sure it installs the CRDs (custom resource definitions) that we'll cite in subsequent steps to define things like the Cluster Issuer--but other than that, the default Helm release settings work out-of-the-box:
+
+```tf
+resource "helm_release" "certmanagerrelease" {
+  name       = "cert-manager"
+  repository = "https://charts.jetstack.io"
+  chart      = "cert-manager"
+  version    = "v1.7.1"
+  namespace  = kubernetes_namespace.certsnamespace.metadata[0].name
+
+  set {
+    name  = "installCRDs"
+    value = "true"
+  }
+}
+```
+
+Run `terraform init` and `terraform apply` to get this module, and the release, up and running. Feel free to verify everything's spun up appropriately:
+
+```sh
+> kubectl get all -n certsnamespace
+```
+
+Next we'll want to apply the Cluster Issuer resource. But it will need some information to automate correctly. In particular, we'll need to provide the DigitalOcean API token (for it to modify DNS records on-the-fly for DNS01 challenges); an email address to use when requesting certificates for renewal notices; and a server address (e.g., staging vs. production) for the ACME API. Create a `variables.tf` for this folder/module and populate with the following:
+
+```tf
+variable "DO_TOKEN" {
+  type        = string
+  description = "API token used to write to the DigitalOcean infrastructure"
+  sensitive   = true
+}
+
+variable "ACME_EMAIL" {
+  type        = string
+  description = "Email address used for ACME cert registration and renewal proces"
+}
+
+variable "ACME_SERVER" {
+  type        = string
+  description = "Address used to configure ClusterIssuer for ACME cert request verification"
+}
+```
+
+Feel free to set these values from the environment, using `$TF_VAR_ACME_EMAIL` and `$TF_VAR_ACME_SERVER`, accordingly. While testing, you should use the "staging" ACME server for Let's Encrypt, "https://acme-staging-v02.api.letsencrypt.org/directory". Since we're using Terraform, it will be trivial to change this over once we're ready for production. Add `ACME_EMAIL` and `ACME_SERVER` to your top-level `variables.tf`.
+
+```tf
+variable "DO_TOKEN" {
+  type        = string
+  description = "API token for DigitalOcean provider; pass using environmental variable $TF_VAR_DO_TOKEN"
+}
+
+variable "HOST_NAME" {
+  type        = string
+  description = "'Base' host name to which app names will be prepended to construct FQDNs"
+}
+
+variable "ACME_EMAIL" {
+  type        = string
+  description = "Email address used for ACME cert registration and renewal proces"
+}
+
+variable "ACME_SERVER" {
+  type        = string
+  description = "Address used to configure ClusterIssuer for ACME cert request verification"
+}
+```
+
+Now we can modify the top-level `main.tf` to pass these values to the correct module:
+
+```tf
+module "doproject" {
+  source = "./doproject"
+}
+
+module "icnamespace" {
+  source    = "./icnamespace"
+  HOST_NAME = var.HOST_NAME
+}
+
+module "certsnamespace" {
+  source      = "./certsnamespace"
+  DO_TOKEN    = var.DO_TOKEN
+  ACME_EMAIL  = var.ACME_EMAIL
+  ACME_SERVER = var.ACME_SERVER
+}
+
+module "wwwnamespace" {
+  source    = "./wwwnamespace"
+  APP_NAME  = "www"
+  HOST_NAME = var.HOST_NAME
+}
+```
+
+Next, we'll need to securely pass the DigitalOcean token into the Kubernetes resources. Naturally, a Kubernetes secret is called for. Create a `dotoksecret.tf` within our "certsnamespace" folder/module and populate accordingly:
+
+```tf
+resource "kubernetes_secret" "dotoksecret" {
+  metadata {
+    name      = "dotoksecret"
+    namespace = kubernetes_namespace.certsnamespace.metadata[0].name
+  }
+
+  data = {
+    access-token = var.DO_TOKEN
+  }
+}
+```
+
+Now we're ready to define our cluster issuer. It's worth reading up on the ACME certificate request process in general:
+
+https://cert-manager.io/docs/configuration/acme/
+
+And for the DigitalOcean configuration for DNS01 challenges in particular:
+
+https://cert-manager.io/docs/configuration/acme/dns01/digitalocean/
+
+Now we're ready to create our cluster issuer. Since it's a cluster-wide resource, it doesn't technically belong in a namespace. For organization purposes, though, we'll keep it here alongside our other "certsnamespace" resources. Create a `clusterissuer.tf` file and populate like so:
+
+```tf
+resource "kubernetes_manifest" "clusterissuer" {
+  manifest = {
+    apiVersion = "cert-manager.io/v1"
+    kind       = "ClusterIssuer"
+
+    metadata = {
+      name = "clusterissuer"
+    }
+
+    spec = {
+      acme = {
+        email  = var.ACME_EMAIL
+        server = var.ACME_SERVER
+
+        privateKeySecretRef = {
+          name = "clusterissuer-secret"
+        }
+
+        solvers = [{
+          dns01 = {
+            digitalocean = {
+              tokenSecretRef = {
+                name = kubernetes_secret.dotoksecret.metadata[0].name
+                key  = "access-token"
+              }
+            }
+          }
+        }]
+      }
+    }
+  }
+}
+```
+
+Lastly, we'll want to export the cluster issuer name from this module because that is how ingress resources will resolve where their cert requests should go. Add an `outputs.tf` file to this folder/module with the following:
+
+```tf
+output "CLUSTER_ISSUER_NAME" {
+  value       = kubernetes_manifest.clusterissuer.manifest.metadata.name
+  description = "Name used by ingress rules to identify where certificate requests within the cluster will be handled"
+}
+```
+
+Now we're ready. Run `terraform apply` and... well, nothing will happen yet. But believe me, this is a big step.
+
+For our last step, we need to go back to our ingress and instruct it to terminate TLS traffic accordingly. To do so, we'll need to make sure the cluster issuer name is passed forward to our "wwwnamespace" module, so update its `variables.tf` file:
+
+```tf
+variable "APP_NAME" {
+  type        = string
+  description = "Name used to construct selector labels and as a subdomain used in building FQDNs for ingress"
+}
+
+variable "HOST_NAME" {
+  type        = string
+  description = "Domain under which ingress FQDNs are constructed"
+}
+
+variable "CLUSTER_ISSUER_NAME" {
+  type        = string
+  description = "Name used by ingress rules to identify where certificate requests within the cluster will be handled"
+}
+```
+
+Then we'll modify the top-level `main.tf` to make sure the value is passed through to this module:
+
+```tf
+module "doproject" {
+  source = "./doproject"
+}
+
+module "icnamespace" {
+  source    = "./icnamespace"
+  HOST_NAME = var.HOST_NAME
+}
+
+module "certsnamespace" {
+  source      = "./certsnamespace"
+  DO_TOKEN    = var.DO_TOKEN
+  ACME_EMAIL  = var.ACME_EMAIL
+  ACME_SERVER = var.ACME_SERVER
+}
+
+module "wwwnamespace" {
+  source              = "./wwwnamespace"
+  APP_NAME            = "www"
+  HOST_NAME           = var.HOST_NAME
+  CLUSTER_ISSUER_NAME = module.certsnamespace.CLUSTER_ISSUER_NAME
+}
+```
+
+Now we're ready to modify our ingress rule. This involves three specific changes:
+
+1. We need to add an annotation, recognized by "cert-manager", to indicate the cluster name where certificate requests will be handled
+
+1. We'll need to add a TLS block defining what address will be issued a certificate
+
+1. That TLS block will also need to define the name of a secret resource (created automatically) where certificate information will be stored once issued
+
+Put together, the "new and improved" ingress resource (`wwwnamespace/ingress.tf`, specifically) will look something like this:
+
+```tf
+resource "kubernetes_ingress_v1" "wwwingress" {
+  metadata {
+    name      = "wwwingress"
+    namespace = kubernetes_namespace.wwwnamespace.metadata[0].name
+
+    annotations = {
+      "cert-manager.io/cluster-issuer" = var.CLUSTER_ISSUER_NAME
+    }
+  }
+
+  spec {
+    ingress_class_name = "nginx"
+
+    tls {
+      hosts       = ["${var.APP_NAME}.${var.HOST_NAME}"]
+      secret_name = "${var.APP_NAME}-tls-secret"
+    }
+
+    rule {
+      host = "${var.APP_NAME}.${var.HOST_NAME}"
+
+      http {
+        path {
+          path      = "/"
+          path_type = "Prefix"
+
+          backend {
+            service {
+              name = kubernetes_service.wwwservice.metadata[0].name
+
+              port {
+                number = kubernetes_service.wwwservice.spec[0].port[0].port
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Now run a `terraform apply` and look for Certificate resources (created automatically). 
+
+```sh
+> kubectl get Certificates --all-namespaces
+NAMESPACE      NAME             READY   SECRET           AGE
+wwwnamespace   www-tls-secret   True    www-tls-secret   68s
+```
+
+It will take a few minutes, but eventually you should see a "READY=true" indicator. This indicates you can now `curl` the secure endpoint. Use a `-kv` flag because these are "staging" certificates that will explicitly be rejected by a browser or standard request, and because we want to inspect relevant certificate details in the exchange.
+
+```sh
+$ curl -kv https://www.mydomain.com
+*   Trying 164.90.247.81:443...
+* Connected to www.mydomain.com (164.90.247.81) port 443 (#0)
+* ALPN, offering h2
+* ALPN, offering http/1.1
+* TLSv1.0 (OUT), TLS header, Certificate Status (22):
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+* TLSv1.2 (IN), TLS header, Certificate Status (22):
+* TLSv1.3 (IN), TLS handshake, Server hello (2):
+* TLSv1.2 (IN), TLS header, Finished (20):
+* TLSv1.2 (IN), TLS header, Supplemental data (23):
+* TLSv1.3 (IN), TLS handshake, Encrypted Extensions (8):
+* TLSv1.2 (IN), TLS header, Supplemental data (23):
+* TLSv1.3 (IN), TLS handshake, Certificate (11):
+* TLSv1.2 (IN), TLS header, Supplemental data (23):
+* TLSv1.3 (IN), TLS handshake, CERT verify (15):
+* TLSv1.2 (IN), TLS header, Supplemental data (23):
+* TLSv1.3 (IN), TLS handshake, Finished (20):
+* TLSv1.2 (OUT), TLS header, Finished (20):
+* TLSv1.3 (OUT), TLS change cipher, Change cipher spec (1):
+* TLSv1.2 (OUT), TLS header, Supplemental data (23):
+* TLSv1.3 (OUT), TLS handshake, Finished (20):
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
+* ALPN, server accepted to use h2
+* Server certificate:
+*  subject: CN=www.mydomain.com
+*  start date: Feb 23 03:53:04 2024 GMT
+*  expire date: May 23 03:53:03 2024 GMT
+*  issuer: C=US; O=(STAGING) Let's Encrypt; CN=(STAGING) Artificial Apricot R3
+*  SSL certificate verify result: unable to get local issuer certificate (20), continuing anyway.
+* Using HTTP2, server supports multiplexing
+* Connection state changed (HTTP/2 confirmed)
+* Copying HTTP/2 data in stream buffer to connection buffer after upgrade: len=0
+* TLSv1.2 (OUT), TLS header, Supplemental data (23):
+* TLSv1.2 (OUT), TLS header, Supplemental data (23):
+* TLSv1.2 (OUT), TLS header, Supplemental data (23):
+* Using Stream ID: 1 (easy handle 0x55a222e46eb0)
+* TLSv1.2 (OUT), TLS header, Supplemental data (23):
+> GET / HTTP/2
+> Host: www.mydomain.com
+> user-agent: curl/7.81.0
+> accept: */*
+>
+* TLSv1.2 (IN), TLS header, Supplemental data (23):
+* TLSv1.3 (IN), TLS handshake, Newsession Ticket (4):
+* TLSv1.2 (IN), TLS header, Supplemental data (23):
+* TLSv1.3 (IN), TLS handshake, Newsession Ticket (4):
+* old SSL session ID is stale, removing
+* TLSv1.2 (IN), TLS header, Supplemental data (23):
+* Connection state changed (MAX_CONCURRENT_STREAMS == 128)!
+* TLSv1.2 (OUT), TLS header, Supplemental data (23):
+* TLSv1.2 (IN), TLS header, Supplemental data (23):
+< HTTP/2 200
+< date: Fri, 23 Feb 2024 04:54:09 GMT
+< content-type: text/html
+< content-length: 615
+< last-modified: Wed, 14 Feb 2024 16:03:00 GMT
+< etag: "65cce434-267"
+< accept-ranges: bytes
+< strict-transport-security: max-age=31536000; includeSubDomains
+<
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+* TLSv1.2 (IN), TLS header, Supplemental data (23):
+* Connection #0 to host www.mydomain.com left intact
+```
+
+If all goes well, you're ready to switch to production! Change the value of your top-level `ACME_SERVER` variable (`$TF_VAR_ACME_SERVER` if you were using environmental variables to define it) to "https://acme-v02.api.letsencrypt.org/directory". Delete the old staging certificate and its secret to force a reissue, then apply the resources:
+
+```sh
+> kubectl delete Certificate/www-tls-secret -n wwwnamespace
+> kubectl delete Secret/www-tls-secret -n wwwnamespace
+> terraform apply
+```
+
+Production certificate requests may take longer to issue, so be patient and wait for the status of the "Certificate" resource to indicate "READY=True":
+
+```sh
+> kubectl get Certificates --all-namespaces
+NAME             READY   SECRET           AGE
+www-tls-secret   True    www-tls-secret   63s
+```
+
+Now you should be able to load HTTPS straight from your browser! How's that for a breath of fresh air?
+
+## Conclusion
+
+Okay, this was actually not a small lift. If you made it this far, congratulations!
+
+But hopefully you've had enough experience with other approaches to realize how painless this was.
+
+In particular, there's a lot of "one time" setup in our cluster here that we'll never need to repeat again.
+
+Incremental applications will be able to reuse the same cert manager, project resources, and ingress controller.
+
+Instead, each application will probably only have a small set of resources, configured with appropriate bindings to cluster-wide utilities:
+
+* Databases using something like StatefulSets and backed by Persistent Volume Templates (though your underlying storage solution may vary)
+
+* Containers using Kubernetes deployments
+
+* Services for both exposed with Kubernetes service resources
+
+* Ingresses to define external routes "into" public service endpoints
+
+* Individual namespaces to wrap up each application within its own isolated concerns
+
+In other words, we have a decently high-grade Kubernetes cluster here, and it's all automated with static IAC. Slick.

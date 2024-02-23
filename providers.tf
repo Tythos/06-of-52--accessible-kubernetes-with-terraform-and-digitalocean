@@ -9,6 +9,11 @@ terraform {
       source  = "hashicorp/kubernetes"
       version = "2.26.0"
     }
+
+    helm = {
+      source = "hashicorp/helm"
+      version = "2.12.1"
+    }    
   }
 }
 
@@ -20,4 +25,12 @@ provider "kubernetes" {
   host                   = module.doproject.CLUSTER_HOST
   token                  = module.doproject.CLUSTER_TOKEN
   cluster_ca_certificate = module.doproject.CLUSTER_CA
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = module.doproject.CLUSTER_HOST
+    token                  = module.doproject.CLUSTER_TOKEN
+    cluster_ca_certificate = module.doproject.CLUSTER_CA
+  }
 }
