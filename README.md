@@ -1138,3 +1138,5 @@ Instead, each application will probably only have a small set of resources, conf
 * Individual namespaces to wrap up each application within its own isolated concerns
 
 In other words, we have a decently high-grade Kubernetes cluster here, and it's all automated with static IAC. Slick.
+
+And of course, don't forget to `terraform destroy` once you're finished, lest you break your cloud provider budget (or free credits limit).
