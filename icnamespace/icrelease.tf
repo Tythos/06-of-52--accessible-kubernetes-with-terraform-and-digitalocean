@@ -9,4 +9,9 @@ resource "helm_release" "icrelease" {
     name  = "controller.ingressClassResource.default"
     value = "true"
   }
+
+  set {
+    name  = "controller.publishService.enabled"
+    value = "true"
+  }
 }
