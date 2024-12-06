@@ -6,9 +6,15 @@ Kubernetes can be a beast, if you haven't paid the price needed to wrap your hea
 
 A new project starts with a domain name. Not for any particular reason--just that it helps to have it in place when we start managing records and defining derivative ingress rules.
 
-So, let's assume you've used DreamHost or GoDaddy and put a few dollars down. We'll use the example `souolibrogenos.us` for this article--it's long enough to be unique, based on the name of a Celtic deity, and uses the `.us` TLD to make sure we're being super-cheap. Who's got more than two dollars to throw at this anyways!?
+So, let's assume you've used DreamHost or GoDaddy and put a few dollars down. We'll use the example `mydomain.com` for this article, which is of course not what you or I *actually* register.
 
-Most importantly, though, are the nameservers used to register records for this domain name, which you will likely need to either a) provide at purchase time, or b) customize once you've purchased your domain. Point those to DigitalOcean, which we'll be using to flesh out our tech stack, and we'll get going:
+Most importantly, though, are the nameservers used to register records for this domain name, which you will likely need to either:
+
+1. Provide at purchase time, or
+
+1. Customize once you've purchased your domain
+
+Point those to DigitalOcean, which we'll be using to flesh out our tech stack, and we'll get going:
 
 * `ns1.digitalocean.com`
 
@@ -24,7 +30,13 @@ To deploy DigitalOcean resources, we'll need an account and an API key. Like mos
 
 ...
 
-Done? Great! Pop that baby into your local shell using an environmental variable (`TF_VAR_DO_TOKEN`). We'll use this token to implicitly authorize Terraform to deploy resources to our cluster. As with any other security key, you don't want this to touch your disk--keep it in memory if possible. Instead, we'll leave it empty in our `variables.tf` file to tell Terraform that it is a required value:
+Done? Great! There are two ways to do the next step: passing this token as an environmental variable, or putting it in a `.tfvars` file where Terraform can find it. 
+
+1. If you pop that baby into your local shell using an environmental variable (`TF_VAR_DO_TOKEN`), you can use this token to implicitly authorize Terraform to deploy resources to our cluster. *THIS IS A REALLY NEAT TRICK*: If you have a Terraform variable, it will by default be populated by an environmental variable (if one exists) that has the `TF_VAR_` prefixed to the same name.  
+
+1. You can also add it to a gitignore'ed `.tfvars` file (as `DO_TOOKEN`). This is a little more risky, because it means a secuer value is now "touching disk" and (if you're not careful) could be accidentally added and tracked by version control. But it also provides more transparency and is more obviously identified/hooked to a specific Terraform `variable` entry.
+
+Regardless of which approach you use, we'll want to reference it in our `variables.tf` file, leaving it empty to tell Terraform that it is a required value:
 
 ```tf
 variable "DO_TOKEN" {
@@ -33,7 +45,7 @@ variable "DO_TOKEN" {
 }
 ```
 
-We'll now use this token to create our `providers.tf` file at the top level of our project. *THIS IS A REALLY NEAT TRICK*: If you have a Terraform variable, it will by default be populated by an environmental variable (if one exists) that has the `TF_VAR_` prefixed to the same name. This is a slick Terraform behavior, and keeps you from being overly-reliant on a `.tfvars` file that could get accidentally added to version control.
+We'll now use this reference to create our `providers.tf` file at the top level of our project. 
 
 ```tf
 terraform {
@@ -50,7 +62,9 @@ provider "digitalocean" {
 }
 ```
 
-We'll use folders within this project define individual Terraform modules, each of which could correspond to a Kubernetes namespace or DigitalOcean project. Let's create one now with an empty `digitalocean_project` resource where our subsequent provider-specific resources will be defined; call it "doproject" for now. Within this folder, we'll define the `digitalocean_project` resource itself, just to test our setup:
+## Modules, Projects, and Namespaces
+
+We'll use folders within this project define individual Terraform modules, each of which could correspond to a Kubernetes namespace or DigitalOcean project (in either case, they're just sets of resources). Let's create a folder/module now with an empty `digitalocean_project` resource where our subsequent provider-specific resources will be defined; call it "doproject" for now. Within this folder, we'll define the `digitalocean_project` resource itself, just to test our setup:
 
 ```tf
 resource "digitalocean_project" "doproject" {
@@ -92,7 +106,7 @@ Okay, we're finally ready to deploy our Kubernetes cluster. Ready to see how dif
 resource "digitalocean_kubernetes_cluster" "docluster" {
   name   = "docluster"
   region = "sfo3"
-  version = "1.29.1-do.0"
+  version = "1.31.1-do.4"
 
   node_pool {
     name       = "worker-pool"
@@ -106,7 +120,7 @@ This is a good time to point out the excellent "slugs" reference page DigitalOce
 
 https://slugs.do-api.dev/
 
-Run `terraform apply` and... poof! You have a functioning Kubernetes cluster! Congratulations.
+Run `terraform apply` and... poof! You have a functioning Kubernetes cluster in the cloud. Congratulations!
 
 Before we get too excited, though, let's make sure this cluster is organized under the DigitalOcean project we created; modify `doproject.tf` to include it:
 
@@ -121,10 +135,11 @@ resource "digitalocean_project" "doproject" {
     digitalocean_kubernetes_cluster.docluster.urn
   ]
 }
+```
 
 It's not usable yet, though, because we can't access it. Subsequent Kubernetes resources (through the provider) will need to know the cluster configuration to deploy to it. And I find it's very helpful to keep a snapshot of the `kubeconfig.yaml` so I can inspect, verify, and debug infrastructure from the command line. Let's do both.
 
-### Come and Get Your Kubeconfig
+## Come and Get Your Kubeconfig
 
 Add an `outputs.tf` file to our "doproject" module/folder. It will extract the raw Kubernetes configuration from the deployed cluster.
 
@@ -144,17 +159,26 @@ output "KUBECONFIG" {
 }
 ```
 
-Run another `terraform apply` and you'll be able to pipe the results to a file (which you should *DEFINITELY* add to your `.gitignore`) and identify with a `$KUBECONFIG` environmental variable:
+Run another `terraform apply` and you'll be able to pipe the results to a file (which you should *DEFINITELY* add to your `.gitignore`) and identify with a `$KUBECONFIG` environmental variable.
+
+On Windows:
+
+```bat
+terraform output -raw KUBECONFIG > kubeconfig.yaml
+set KUBECONFIG="%CD%\kubeconfig.yaml"
+```
+
+On Unix:
 
 ```sh
-> terraform output -raw KUBECONFIG > kubeconfig.yaml
-> set KUBECONFIG="%CD%/kubeconfig.yaml"
+terraform output -raw KUBECONFIG > kubeconfig.yaml
+export KUBECONFIG="$PWD/kubeconfig.yaml"
 ```
 
 You can now verify that `kubectl` can communicate with your cluster:
 
 ```sh
-> kubectl cluster-info
+kubectl cluster-info
 ```
 
 Lastly, let's pass the specific config data to a second top-level provider, `hashicorp/kubernetes`. Add three new outputs to our "doproject" module: the cluster host, the cluster token, and the CA certificate:
@@ -210,7 +234,7 @@ provider "kubernetes" {
 
 ## Kubernetes Resources
 
-We're set! We have a functioning cluster and we're ready to deploy Kubernetes resources. Let's start with a basic NGINX container to demonstrate. Create a new folder/module, "wwwnamespace". We'll use individual Terraform modules to organize specific Kubernetes namespaces, so add to this folder a `wwwnamespace.tf` file and populate accordingly:
+We're set! We have a functioning cluster and we're ready to deploy Kubernetes resources. Let's start with a basic nginx container for demonstration purposes. Create a new folder/module, "wwwnamespace". We'll use individual Terraform modules specifically to organize specific Kubernetes namespaces from here on out, so add to this folder a `wwwnamespace.tf` file and populate accordingly:
 
 ```tf
 resource "kubernetes_namespace" "wwwnamespace" {
@@ -232,7 +256,7 @@ module "wwwnamespace" {
 }
 ```
 
-Since we create a new module, and added a new provider, you'll need to run `terraform init` again. Once that's done, run `terraform apply` and you should see your Kubernetes namespace appear in no time!
+Since we create a new module, and added a new provider, you'll need to run `terraform init` again. Once that's done, run `terraform apply` and you should see your Kubernetes namespace appear in no time when you run the appropiate `kubectl` query!
 
 ```sh
 > kubectl get ns
@@ -256,7 +280,7 @@ Let's go through each step now.
 
 ## First, the Deployment
 
-We want a basic NGINX container. No problem! Add a `wwwdeployment.tf` to our "wwwnamespace" module and populate accordingly:
+We want a basic nginx container. No problem! Add a `wwwdeployment.tf` to our "wwwnamespace" module and populate accordingly:
 
 ```tf
 resource "kubernetes_deployment" "wwwdeployment" {
@@ -292,7 +316,7 @@ resource "kubernetes_deployment" "wwwdeployment" {
 }
 ```
 
-Notice we've used a new variable `APP_NAME` here. It's good practice to define "magic strings" as Terraform variables because it helps ensure Kubernetes (which is stateless at this level) always has consistent "knowledge" and there are no chances of fat-fingering a bad selector label. Services and other resources can use these variables, too. Let's define the `APP_NAME` value at the top level and "pass" it into the module. That means adding a `variables.tf` in our "wwwnamespace" folder/module:
+Notice we've used a new variable `APP_NAME` here. It's good practice to define "magic strings" (like names and selector labels) as Terraform variables because it helps ensure Kubernetes (which is stateless at this level) always has consistent "knowledge" and there are no chances of fat-fingering a bad reference. Services and other resources can use these variables, too. Let's define the `APP_NAME` value at the top level and "pass" it into the module. That means adding a `variables.tf` in our "wwwnamespace" folder/module:
 
 ```tf
 variable "APP_NAME" {
@@ -328,7 +352,7 @@ NAME                                      DESIRED   CURRENT   READY   AGE
 replicaset.apps/wwwdeployment-d79bb5b9d   1         1         1       27s
 ```
 
-### Next, the Service
+## Next, the Service
 
 We need to identify this deployment within our internal cluster network. To do so, we'll next add a `wwwservice.tf` file and populate accordingly:
 
@@ -369,19 +393,19 @@ NAME                                      DESIRED   CURRENT   READY   AGE
 replicaset.apps/wwwdeployment-d79bb5b9d   1         1         1       5m27s
 ```
 
-### Lastly, the Ingress
+## Lastly, the Ingress
 
 A careful observer will note that we didn't define a Service "type". In our case, this defaulted to "ClusterIP", which means the service was assigned a specific address on the internal Kubernetes network. This does not, however, "expose" the service for access to external users.
 
 And here's where things get fun. A traditional cluster will have at least three "meta" applications running at any given time:
 
-* A load balancer, to define an entry point for distribution of traffic
+* A load balancer, to define distribution of traffic from an external entry point into the cluster
 
-* An ingress controller, for enforcing ingress rules against the load balancer traffic-routing policies
+* An ingress controller, for enforcing a set of ingress rules against the load balancer traffic-routing policies
 
-* A cert manager, for automatically securing ingress TLS termination
+* A cert manager, for automatically securing TLS termination on ingress
 
-Load balancers are particularly sticky. If you are operating an on-prem cluster, you will likely be using something like MetalLB (or something provided by your Kubernetes "substrate", like k3s or microk8s, automatically). However, if you are operating on a provider, like AWS or DigitalOcean, the load balancer is implemented by the provider.
+Load balancers are particularly sticky. If you are operating an on-prem cluster, for example, you will likely be using something like MetalLB (or some functional equivalent like Traefik, automatically provided in many cases by your Kubernetes "substrate" like microk8s). However, if you are operating on a provider, like AWS or DigitalOcean, the load balancer is unique to that platform and implemented by the provider.
 
 We're going to define our ingress anyways, even though nothing exists yet to "enforce" (or secure) it. Create a `wwwingress.tf` file in our "wwwnamespace" folder/module and populate accordingly. If you're coming from a "traditional" or manual Kubernetes background, note how useful it is to procedurally bind to the service properties! Terraform really is wonderful.
 
@@ -419,7 +443,7 @@ resource "kubernetes_ingress_v1" "wwwingress" {
 }
 ```
 
-One thing I should point out here: We are assuming, if you have registered `mydomain.com`, that you are organizing service ingresses under a subdomain using the "application" name we defined in `APP_NAME`. This means two things: First, that we can "dynamically" construct the `host` property of the ingress by combining the two, so long as we have also passed `HOST_NAME` into the Terraform context. Second, that we do indeed want such a "prefix" rule for our ingress paths. There are good reasons sometimes for doing otherwise, but this is a good approach for now. Modify the folder/module `variables.tf` accordingly:
+One thing I should point out here: We are assuming, if you have registered the domain name "mydomain.com", that you are organizing service ingresses under a subdomain using the "application" name we defined in `APP_NAME`. This means two things: First, that we can "dynamically" construct the `host` property of the ingress by combining the two, so long as we have also passed `HOST_NAME` into the Terraform context. Second, that we do indeed want such a "prefix" rule for our ingress paths. There are good reasons sometimes for doing otherwise, but this is a good approach for now. Modify the folder/module `variables.tf` accordingly:
 
 ```tf
 variable "APP_NAME" {
@@ -483,7 +507,7 @@ module "wwwnamespace" {
 }
 ```
 
-If you look at the official documentation, you'll see there are several ways to deploy the NGINX ingress controller. We'll be using a Helm-based approach for two reasons:
+If you look at the official documentation, you'll see there are several ways to deploy the nginx ingress controller. We'll be using a Helm-based approach for two reasons:
 
 1. It's self-contained and easy to configure & deploy
 
@@ -560,13 +584,18 @@ resource "helm_release" "icrelease" {
     name  = "controller.ingressClassResource.default"
     value = "true"
   }
+
+  set {
+    name  = "controller.publishService.enabled"
+    value = "true"
+  }
 }
 ```
 
 Now run a `terraform init` (remember we have a new provider) and a `terraform apply`. You now have a running ingress controller! Pretty slick, isn't it, to treat Helm releases as just another resource, and with values from procedural bindings? Look at the resulting resources deployed to this namespace to verify everything is running:
 
 ```sh
->kubectl get all -n icnamespace
+> kubectl get all -n icnamespace
 NAME                                                         READY   STATUS    RESTARTS   AGE
 pod/nginx-ingress-ingress-nginx-controller-55dcf9879-r2ztl   1/1     Running   0          2m50s
 
@@ -581,10 +610,12 @@ NAME                                                               DESIRED   CUR
 replicaset.apps/nginx-ingress-ingress-nginx-controller-55dcf9879   1         1         1       2m50s
 ```
 
-And take another look at our ingress, which should now reflect enforcement:
+And take another look at our ingress, whose "CLASS" colume should should now reflect enforcement by nginx:
 
 ```sh
 > kubectl get Ingresses --all-namespaces
+NAMESPACE      NAME         CLASS   HOSTS              ADDRESS   PORTS   AGE
+wwwnamespace   wwwingress   nginx   www.mydomain.com             80      5m26s
 ```
 
 ## Automating Record Management
@@ -663,6 +694,22 @@ resource "digitalocean_record" "dorecord" {
 }
 ```
 
+For the purposes of debugging (via `nslookup` or similar), it might be help to add an output reporting what public IP address was used. Create a `icnamespace/outputs.tf` file and populate accordingly:
+
+```tf
+output "PUBLIC_IP" {
+  value = digitalocean_domain.dodomain.ip_address
+}
+```
+
+Then, add this value to the top-level `outputs.tf` file so we can see it when we apply:
+
+```tf
+output "PUBLIC_IP" {
+  value = module.icnamespace.PUBLIC_IP
+}
+```
+
 Lastly, if we want, we can go back to our DigitalOcean "project" resource and make sure they are all organized under there as well, but strictly speaking this isn't necessary. You can now run `terraform init` and `terraform apply`. Then verify with a `curl` command:
 
 ```sh
@@ -700,9 +747,11 @@ Our last exercise here is traditionally one of the hardest operations in systems
 
 Fortunately, we've made a judicious selection of technologies in our stack here. It turns out to be relatively straightforward!
 
-We'll use a "cert-manager" Helm release, much like we did with our NGINX-based ingress controller, and provide the appropriate bindings to enable DigitalOcean to handle the ACME challenges directly. Since DigitalOcean is operating the nameservers our records are using, this greatly simplifies the process to the point where you may not even notice initial challenges and renewals.
+We'll use a "cert-manager" Helm release, much like we did with our nginx-based ingress controller, and provide the appropriate bindings to enable DigitalOcean to handle the ACME challenges directly.
 
-Create a new folder/module for "certsnamespace" and include it in the top-level `main.tf`:
+Since DigitalOcean is operating the nameservers our records are using, this greatly simplifies the process to the point where you may not even notice initial challenges and renewals.
+
+Create a new folder/module for "certsnamespace" and include it in the top-level `main.tf`, which should have grown to look something like this by now:
 
 ```tf
 module "doproject" {
@@ -715,13 +764,13 @@ module "icnamespace" {
 }
 
 module "certsnamespace" {
-  source = "./certsnamespace"
+  source      = "./certsnamespace"
 }
 
 module "wwwnamespace" {
-  source    = "./wwwnamespace"
-  APP_NAME  = "www"
-  HOST_NAME = var.HOST_NAME
+  source              = "./wwwnamespace"
+  APP_NAME            = "www"
+  HOST_NAME           = var.HOST_NAME
 }
 ```
 
@@ -758,7 +807,7 @@ Run `terraform init` and `terraform apply` to get this module, and the release, 
 > kubectl get all -n certsnamespace
 ```
 
-Next we'll want to apply the Cluster Issuer resource. But it will need some information to automate correctly. In particular, we'll need to provide the DigitalOcean API token (for it to modify DNS records on-the-fly for DNS01 challenges); an email address to use when requesting certificates for renewal notices; and a server address (e.g., staging vs. production) for the ACME API. Create a `variables.tf` for this folder/module and populate with the following:
+Next we'll want to apply the Cluster Issuer resource. But it will need some information to automate correctly. In particular, we'll need to provide the DigitalOcean API token (for it to modify DNS records on-the-fly for DNS01 challenges); an email address to use when requesting certificates for renewal notices; and a server address (e.g., staging vs. production) for the ACME API. Create a `certsnamespace/variables.tf` file and populate with the following:
 
 ```tf
 variable "DO_TOKEN" {

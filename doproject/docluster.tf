@@ -1,7 +1,7 @@
 resource "digitalocean_kubernetes_cluster" "docluster" {
   name    = "docluster"
   region  = "sfo3"
-  version = "1.29.1-do.0"
+  version = "1.31.1-do.4"
 
   node_pool {
     name       = "worker-pool"
